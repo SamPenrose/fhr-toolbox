@@ -244,3 +244,43 @@ def set_usage_segment(fhr):
     activity = [extract_activity(day) for day in data['days']]
     activity = [d for d in activity if d]
     fhr['usage']['activity'] = activity
+
+    average_sessions_per_day = sum(
+        [d['session_count'] for d in activity]
+    ) / len(data['days']) # intentional truncating division
+    if average_sessions_per_day >= 5:
+        fhr['usage']['activity'][
+            'average_sessions_per_day'] = "5+"
+    else:
+        fhr['usage']['activity'][
+            'average_sessions_per_day'] = str(average_sessions_per_day)
+    hours = sum(
+        [d['total_seconds'] for d in activity] # not active_seconds
+    ) / 3600.0 # truncate once, in next statement
+    average_hours_per_day = hours / len(data['days'])
+    if average_hours_per_day >= 6:
+        fhr['usage']['activity'][
+            'average_hours_per_day'] = "6+"
+    else:
+        fhr['usage']['activity'][
+            'average_hours_per_day'] = str(average_hours_per_day)
+    years = (ping_date - creation_date).days / 365
+    if years >= 5:
+        fhr['usage']['activity']['years'] = "5+"
+    else:
+        fhr['usage']['activity']['years'] = str(years)
+
+
+    '''
+    rhcollect(list(
+        startdate = histinfo$startdate,
+        window = histinfo$window,
+        isdefault = def$group,
+        toggledefault = def$nswitches,
+        activedates = dateseq,
+        weeklyndays = weekly,
+        weeklytrend = trend,
+        profyears = profyears,
+        dailynsess = avgnsess,
+        dailyhours = avghours),
+'''
