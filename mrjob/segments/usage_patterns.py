@@ -4,7 +4,10 @@ Port github.com/mozilla/churn-analysis/usage-patterns-jobs.R to Python.
 Rather than discarding bad records, let's mark them with the reason for
 rejecting them.
 """
-import datetime as DT
+import datetime as DT, numbers
+
+FHR_RETENTION_DAYS = 180
+SECONDS_PER_TICK = 5
 
 MISSING_FIELDS = 'Missing fields: '
 CORRUPTED_FIELDS = 'Corrupted fields: '
@@ -59,12 +62,12 @@ def set_usage_segment(fhr):
             return
 
         ping_age = (today - ping_date).days
-        if ping_age > 180:
+        if ping_age > FHR_RETENTION_DAYS:
             reasons.append(TOO_OLD)
             return
 
-        ping_less_180 = ping_date - DT.timedelta(180)
-        start_date = max(creation_date, ping_less_180)
+        ping_less_retention = ping_date - DT.timedelta(FHR_RETENTION_DAYS)
+        start_date = max(creation_date, ping_less_retention)
         window = (ping_date - start_date).days
         fhr['usage']['start_date'] = start_date
         fhr['usage']['window'] = window
@@ -202,6 +205,42 @@ def set_usage_segment(fhr):
             return 0
         clean_ticks = activity.get('cleanActiveTicks', [])
         aborted_ticks = activity.get('abortedActiveTicks', [])
-        if ((len(clean_seconds) + len(aborted_seconds))
-        != (len(clean_ticks) + len(aborted_ticks))):
+
+        all_times = clean_seconds + aborted_seconds
+        all_ticks = clean_ticks + aborted_ticks
+        if len(all_times) != len(all_ticks):
             return 0
+        # XXX also test for lengths of 'firstPaint' and 'main'?
+
+        # Filter any indices which have a bad value of either type
+        # XXX Here we assume that the indices of the all_ lists can be
+        # mapped to each other; theoretically we might map clean_::aborted_
+        RETENTION_SECONDS = FHR_RETENTION_DAYS * 24 * 3600
+        RETENTION_TICKS = RETENTION_SECONDS / SECONDS_PER_TICK
+        valid_times = []
+        valid_ticks = []
+        for i, time_value in enumerate(all_times):
+            # Do we have two valid values?
+            if not isinstance(time_value, numbers.Number):
+                continue
+            if not (0 < time_value < RETENTION_SECONDS):
+                continue
+            tick_value = all_ticks[i]
+            if not isinstance(tick_value, numbers.Number):
+                continue
+            if not (0 <= tick_value < RETENTION_TICKS):
+                continue
+            # Are the values coherent when compared to each other?
+            if (tick_value * SECONDS_PER_TICK) > time_value:
+                continue
+            # Heuristics pass
+            valid_times.append(time_value)
+            valid_ticks.append(tick_value)
+        # XXX activity.R breaks len, sum, sum into a separate function
+        return {'session_count': len(valid_times),
+                'total_seconds': sum(valid_times),
+                'active_seconds': sum(valid_ticks * SECONDS_PER_TICK)}
+
+    activity = [extract_activity(day) for day in data['days']]
+    activity = [d for d in activity if d]
+    fhr['usage']['activity'] = activity
