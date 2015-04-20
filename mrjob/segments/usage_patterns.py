@@ -5,6 +5,7 @@ Rather than discarding bad records, let's mark them with the reason for
 rejecting them.
 """
 import datetime as DT, numbers
+from .. import healthreportutils as HRU
 
 FHR_RETENTION_DAYS = 180
 SECONDS_PER_TICK = 5
@@ -33,6 +34,267 @@ def parse_date(value):
         except ValueError: # NaN or e.g. month == 0
             pass
     return result
+
+
+class FHRUsage(object):
+    '''
+    Wrapper for the JSON blob that calculates its usage data.
+    XXX integrate with healthreportutils.FHRPayload()
+    '''
+    def __init__(self, fhr):
+        self.fhr = fhr
+        self.missing_fields = set()
+        self.corrupted_fields = set()
+        self.other_problems = set()
+        # Above here should migrate
+        self.reasons = []
+
+    @HRU.CachedProperty
+    def data(self):
+        result = self.fhr.get('data', {})
+        if not result:
+            self.missing_fields.add('data')
+        return result
+
+    @HRU.CachedProperty
+    def creation_date(self):
+        result = None
+        iso_formatted = self.data.get('last', {}).get(
+            'org.mozilla.profile.age', {}).get('profileCreation')
+        if iso_formatted is None:
+            self.missing_fields.add('profileCreation')
+        else:
+            result = parse_date(iso_formatted)
+            if result is None:
+                self.corrupted_fields.add('profileCreation')
+        return result
+
+    @HRU.CachedProperty
+    def ping_date(self):
+        result = None
+        iso_formatted = self.data.get('thisPingDate')
+        if iso_formatted is None:
+            self.missing_fields.add('thisPingDate')
+        else:
+            result = parse_date(iso_formatted)
+            if result is None:
+                self.corrupted_fields.add('thisPingDate')
+        return result
+
+    @HRU.CachedProperty
+    def start_date(self):
+        if not self.creation_date or not self.ping_date:
+            return None
+
+        today = DT.datetime.now().date()
+        if not ((self.creation_date <= self.ping_date)
+                and (self.ping_date <= today)):
+            self.other_problems.add(
+                CLOCK_SKEW % (self.ping_date, self.creation_date, today))
+            return None
+
+        ping_age = (today - self.ping_date).days
+        if ping_age > FHR_RETENTION_DAYS:
+            self.other_problems.add(TOO_OLD)
+            return None
+        ping_less_retention = self.ping_date - \
+                              DT.timedelta(FHR_RETENTION_DAYS)
+        return max(self.creation_date, ping_less_retention)
+
+    @HRU.CachedProperty
+    def window(self):
+        return (self.ping_date - self.start_date).days
+
+    @HRU.CachedProperty
+    def days(self):
+        '''
+        A JSON-ish list.
+        '''
+        result = self.data.get('days', {})
+        if not result:
+            self.missing_fields.add('days')
+        return result
+
+    @HRU.CacheProperty
+    def active_days(self):
+        '''
+        XXX review with dzeber
+        '''
+        if not self.days or not self.ping_date or not self.start_date:
+            return []
+        active = [parse_date(d) for d in self.days]
+        active = [d for d in active if d] # XXX flag corrupted?
+        active = [d for d in active if
+                  ((self.start_date <= d)
+                   and
+                   (d <= self.ping_date))]
+        active.sort()
+        if not active:
+            self.other_problems.add(INACTIVE)
+        elif (active[-1][0] - active[0][0]).days < 14:
+            self.other_problems.add(INACTIVE)
+        return active
+
+    @HRU.CachedProperty
+    def default(self):
+        '''
+        XXX Too specific to a particular output format.
+        '''
+        default_days = []
+        unmeasured = True
+        never = True
+        switch_count = 0 # -> to int
+        last = None
+        for date in self.active_days:
+            app_info = self.days[date.isoformat()].get(
+                'org.mozilla.appInfo.appinfo', {})
+            is_default = app_info.get('isDefaultBrowser')
+            if is_default:
+                default_days.push(date)
+                unmeasured = False
+            elif is_default == 0:
+                unmeasured = False
+                if (last is not None) and (last != is_default):
+                    switch_count += 1
+                last = is_default
+
+        active = float(len(self.active_days))
+        default = float(len(default_days))
+        always = active == default
+        never = not bool(default)
+        ratio = default / active
+        label = 'sometimes'
+        if ratio > 0.8:
+            label = 'mostly'
+        elif ratio < 0.2:
+            label = 'rarely'
+        switches = 'one' if switch_count < 2 else 'multiple'
+        return {'active': active,
+                'default': default,
+                'always': always,
+                'label': label,
+                'never': never,
+                'switch_count': switch_count,
+                'switches': switches,
+                'unmeasured': unmeasured}
+
+    @HRU.CachedProperty
+    def weekly_active_days(self):
+        '''
+        The R version threw me; here's my effort. We measure weeks Sa->Su;
+        the datetime.date() object indexes them M->Su::0->6 .
+        '''
+        one_day = DT.timedelta(1)
+        # Truncate to the first Sunday.
+        start_date = self.start_date
+        while start_date.weekday() != 6:
+            start_date = start_date + one_day
+        # Truncate to the last Saturday.
+        end_date = self.ping_date
+        while end_date.weekday() != 5:
+            end_date = end_date - one_day
+
+        weeks = []
+        while start_date < end_date:
+            this_week = 0
+            while start_date.weekday != 5:
+                if self.data.get(start_date.iso_format()):
+                    this_week += 1
+                start_date = start_date + one_day
+            weeks.append(this_week)
+        return weeks
+
+    def activity_trend(self):
+        '''
+        XXX find Python equiv to built-in R functions for determining
+        slope of activity against time and p-value of finding.
+        '''
+
+    @HRU.CachedProperty
+    def activity_by_day(self):
+        activity = [extract_activity(self.fhr, iso_format, day)
+                    for (iso_format, day) in self.days.items()]
+        activity = [d for d in activity if d]
+        result = {}
+
+        average_sessions_per_day = sum(
+            [d['session_count'] for d in activity]
+        ) / len(self.days) # intentional truncating division
+        if average_sessions_per_day >= 5:
+            result['average_sessions_per_day'] = "5+"
+        else:
+            result['average_sessions_per_day'] = str(
+                average_sessions_per_day)
+        hours = sum(
+            [d['total_seconds'] for d in activity] # not active_seconds
+        ) / 3600.0 # truncate once, in next statement
+        average_hours_per_day = hours / len(self.data['days'])
+        if average_hours_per_day >= 6:
+            result['average_hours_per_day'] = "6+"
+        else:
+            result['average_hours_per_day'] = str(average_hours_per_day)
+        years = (self.ping_date - self.creation_date).days / 365
+        if years >= 5:
+            result['years'] = "5+"
+        else:
+            result['years'] = str(years)
+        result['by_day'] = activity
+        return result
+
+def extract_activity(fhr, iso_format, day):
+    '''
+    mozilla/fhr-r-rollups/activity.R : allActivity : <anon>
+    XXX Do we track per-day record corruption/inadequacy?
+    '''
+    activity = day.get('org.mozilla.appSessions.previous')
+    if not activity:
+        return {}
+
+    # All these are lists of integers
+    clean_seconds = activity.get('cleanTotalTime')
+    if not clean_seconds: # missing or []
+        return {}
+    aborted_seconds = activity.get('abortedTotalTime', [])
+    if len(clean_seconds) != len(aborted_seconds):
+        return {}
+    clean_ticks = activity.get('cleanActiveTicks', [])
+    aborted_ticks = activity.get('abortedActiveTicks', [])
+
+    all_times = clean_seconds + aborted_seconds
+    all_ticks = clean_ticks + aborted_ticks
+    if len(all_times) != len(all_ticks):
+        return {}
+    # XXX also test for lengths of 'firstPaint' and 'main'?
+
+    # Filter any indices which have a bad value of either type
+    # XXX Here we assume that the indices of the all_ lists can be
+    # mapped to each other; theoretically we might map clean_::aborted_
+    RETENTION_SECONDS = FHR_RETENTION_DAYS * 24 * 3600
+    RETENTION_TICKS = RETENTION_SECONDS / SECONDS_PER_TICK
+    valid_times = []
+    valid_ticks = []
+    for i, time_value in enumerate(all_times):
+        # Do we have two valid values?
+        if not isinstance(time_value, numbers.Number):
+            continue
+        if not (0 < time_value < RETENTION_SECONDS):
+            continue
+        tick_value = all_ticks[i]
+        if not isinstance(tick_value, numbers.Number):
+            continue
+        if not (0 <= tick_value < RETENTION_TICKS):
+            continue
+        # Are the values coherent when compared to each other?
+        if (tick_value * SECONDS_PER_TICK) > time_value:
+            continue
+        # Heuristics pass
+        valid_times.append(time_value)
+        valid_ticks.append(tick_value)
+    # XXX activity.R breaks len, sum, sum into a separate function
+    return {'day': iso_format,
+            'session_count': len(valid_times),
+            'total_seconds': sum(valid_times),
+            'active_seconds': sum(valid_ticks * SECONDS_PER_TICK)}
 
 
 def set_usage_segment(fhr):
@@ -100,176 +362,11 @@ def set_usage_segment(fhr):
     else:
         missing_fields.append('days')
 
-    def calculate_default_status(active_days):
-        """
-        Track how often FF is set as the default browser.
-        """
-        default_days = []
-        unmeasured = True
-        never = True
-        switch_count = 0 # -> to int
-        last = None
-        for (date, string) in active_days:
-            app_info = data['days'][string].get(
-                'org.mozilla.appInfo.appinfo', {})
-            is_default = app_info.get('isDefaultBrowser')
-            if is_default:
-                default_days.push((date, string))
-                unmeasured = False
-            elif is_default == 0:
-                unmeasured = False
-            if (last is not None) and (last != is_default):
-                switch_count += 1
-            last = is_default
-
-        active = float(len(active_days))
-        default = float(len(default_days))
-        always = active == default
-        never = not bool(default)
-        ratio = default / active
-        label = 'sometimes'
-        if ratio > 0.8:
-            label = 'mostly'
-        elif ratio < 0.2:
-            label = 'rarely'
-        switches = 'one' if switch_count < 2 else 'multiple'
-        fhr['usage']['default'] = {'active': active,
-                                   'default': default,
-                                   'always': always,
-                                   'label': label,
-                                   'never': never,
-                                   'switch_count': switch_count,
-                                   'switches': switches,
-                                   'unmeasured': unmeasured}
-
     calculate_default_status(active_days)
     if fhr['usage']['default']['unmeasured']:
         reasons.append(DEFAULT_UNMEASURED)
 
-    def count_weekly_active_days():
-        '''
-        The R version threw me; here's my effort. We measure weeks Sa->Su;
-        the datetime.date() object indexes them M->Su::0->6 .
-        '''
-        one_day = DT.timedelta(1)
-        # Truncate to the first Sunday.
-        start_date = fhr['usage']['start_date']
-        while start_date.weekday() != 6:
-            start_date = start_date + one_day
-
-        # Truncate to the last Saturday.
-        end_date = ping_date
-        while end_date.weekday() != 5:
-            end_date = end_date - one_day
-
-        weeks = []
-        while start_date < end_date:
-            this_week = 0
-            while start_date.weekday != 5:
-                date_string = start_date.iso_format() # XXX fix "string" above
-                if data.get(date_string):
-                    this_week += 1
-                start_date = start_date + one_day
-            weeks.append(this_week)
-        fhr['usage']['weekly_active_days'] = weeks
     count_weekly_active_days()
-
-    def get_activity_trend():
-        '''
-        XXX find Python equiv to built-in R functions for determining
-        slope of activity against time and p-value of finding.
-        '''
-    get_activity_trend()
-
-    '''
-    ## Covariate groupings.
-    activity <- totalActivity(days)
-    This is from mozilla/fhr-r-rollups/activity.R .
-    '''
-    def extract_activity(day):
-        '''
-        mozilla/fhr-r-rollups/activity.R : allActivity : <anon>
-        XXX Do we track per-day record corruption/inadequacy?
-          returning 0 will tell us *something* went wrong
-        '''
-        activity = day.get('org.mozilla.appSessions.previous')
-        if not activity:
-            return 0
-
-        # All these are lists of integers
-        clean_seconds = activity.get('cleanTotalTime')
-        if not clean_seconds: # missing or []
-            return 0
-        aborted_seconds = activity.get('abortedTotalTime', [])
-        if len(clean_seconds) != len(aborted_seconds):
-            return 0
-        clean_ticks = activity.get('cleanActiveTicks', [])
-        aborted_ticks = activity.get('abortedActiveTicks', [])
-
-        all_times = clean_seconds + aborted_seconds
-        all_ticks = clean_ticks + aborted_ticks
-        if len(all_times) != len(all_ticks):
-            return 0
-        # XXX also test for lengths of 'firstPaint' and 'main'?
-
-        # Filter any indices which have a bad value of either type
-        # XXX Here we assume that the indices of the all_ lists can be
-        # mapped to each other; theoretically we might map clean_::aborted_
-        RETENTION_SECONDS = FHR_RETENTION_DAYS * 24 * 3600
-        RETENTION_TICKS = RETENTION_SECONDS / SECONDS_PER_TICK
-        valid_times = []
-        valid_ticks = []
-        for i, time_value in enumerate(all_times):
-            # Do we have two valid values?
-            if not isinstance(time_value, numbers.Number):
-                continue
-            if not (0 < time_value < RETENTION_SECONDS):
-                continue
-            tick_value = all_ticks[i]
-            if not isinstance(tick_value, numbers.Number):
-                continue
-            if not (0 <= tick_value < RETENTION_TICKS):
-                continue
-            # Are the values coherent when compared to each other?
-            if (tick_value * SECONDS_PER_TICK) > time_value:
-                continue
-            # Heuristics pass
-            valid_times.append(time_value)
-            valid_ticks.append(tick_value)
-        # XXX activity.R breaks len, sum, sum into a separate function
-        return {'session_count': len(valid_times),
-                'total_seconds': sum(valid_times),
-                'active_seconds': sum(valid_ticks * SECONDS_PER_TICK)}
-
-    activity = [extract_activity(day) for day in data['days']]
-    activity = [d for d in activity if d]
-    fhr['usage']['activity'] = activity
-
-    average_sessions_per_day = sum(
-        [d['session_count'] for d in activity]
-    ) / len(data['days']) # intentional truncating division
-    if average_sessions_per_day >= 5:
-        fhr['usage']['activity'][
-            'average_sessions_per_day'] = "5+"
-    else:
-        fhr['usage']['activity'][
-            'average_sessions_per_day'] = str(average_sessions_per_day)
-    hours = sum(
-        [d['total_seconds'] for d in activity] # not active_seconds
-    ) / 3600.0 # truncate once, in next statement
-    average_hours_per_day = hours / len(data['days'])
-    if average_hours_per_day >= 6:
-        fhr['usage']['activity'][
-            'average_hours_per_day'] = "6+"
-    else:
-        fhr['usage']['activity'][
-            'average_hours_per_day'] = str(average_hours_per_day)
-    years = (ping_date - creation_date).days / 365
-    if years >= 5:
-        fhr['usage']['activity']['years'] = "5+"
-    else:
-        fhr['usage']['activity']['years'] = str(years)
-
 
     '''
     rhcollect(list(
@@ -284,3 +381,44 @@ def set_usage_segment(fhr):
         dailynsess = avgnsess,
         dailyhours = avghours),
 '''
+def calculate_default_status(active_days):
+    """
+    Track how often FF is set as the default browser.
+    """
+    default_days = []
+    unmeasured = True
+    never = True
+    switch_count = 0 # -> to int
+    last = None
+    for (date, string) in active_days:
+        app_info = data['days'][string].get(
+            'org.mozilla.appInfo.appinfo', {})
+        is_default = app_info.get('isDefaultBrowser')
+        if is_default:
+            default_days.push((date, string))
+            unmeasured = False
+        elif is_default == 0:
+            unmeasured = False
+            if (last is not None) and (last != is_default):
+                switch_count += 1
+                last = is_default
+
+    active = float(len(active_days))
+    default = float(len(default_days))
+    always = active == default
+    never = not bool(default)
+    ratio = default / active
+    label = 'sometimes'
+    if ratio > 0.8:
+        label = 'mostly'
+    elif ratio < 0.2:
+        label = 'rarely'
+        switches = 'one' if switch_count < 2 else 'multiple'
+    fhr['usage']['default'] = {'active': active,
+                               'default': default,
+                               'always': always,
+                               'label': label,
+                               'never': never,
+                               'switch_count': switch_count,
+                               'switches': switches,
+                               'unmeasured': unmeasured}
