@@ -19,7 +19,6 @@ CLOCK_SKEW = 'Ping date "%s" does not fall between creation date "%s" ' \
 INACTIVE = 'FHR activity spanned less than two weeks'
 DEFAULT_UNMEASURED = 'No data for isDefaultBrowser'
 
-
 def parse_date(value):
     """
     FHR dates take the form '%Y-%m-%d', but Python's wacky date.__init__
@@ -59,20 +58,22 @@ class FHRUsage(object):
     @HRU.CachedProperty
     def creation_date(self):
         result = None
-        iso_formatted = self.data.get('last', {}).get(
+        days_since_epoch = self.data.get('last', {}).get(
             'org.mozilla.profile.age', {}).get('profileCreation')
-        if iso_formatted is None:
+        if days_since_epoch is None:
             self.missing_fields.add('profileCreation')
         else:
-            result = parse_date(iso_formatted)
-            if result is None:
+            try:
+                timestamp = days_since_epoch * 24 * 3600
+                result = DT.date.fromtimestamp(timestamp)
+            except Exception:
                 self.corrupted_fields.add('profileCreation')
         return result
 
     @HRU.CachedProperty
     def ping_date(self):
         result = None
-        iso_formatted = self.data.get('thisPingDate')
+        iso_formatted = self.fhr.get('thisPingDate')
         if iso_formatted is None:
             self.missing_fields.add('thisPingDate')
         else:
@@ -115,7 +116,7 @@ class FHRUsage(object):
             self.missing_fields.add('days')
         return result
 
-    @HRU.CacheProperty
+    @HRU.CachedProperty
     def active_days(self):
         '''
         XXX review with dzeber
@@ -131,8 +132,9 @@ class FHRUsage(object):
         active.sort()
         if not active:
             self.other_problems.add(INACTIVE)
-        elif (active[-1][0] - active[0][0]).days < 14:
+        elif (active[-1] - active[0]).days < 14:
             self.other_problems.add(INACTIVE)
+            return []
         return active
 
     @HRU.CachedProperty
@@ -140,6 +142,8 @@ class FHRUsage(object):
         '''
         XXX Too specific to a particular output format.
         '''
+        if not self.active_days:
+            return {}
         default_days = []
         unmeasured = True
         never = True
@@ -195,12 +199,15 @@ class FHRUsage(object):
             end_date = end_date - one_day
 
         weeks = []
+
         while start_date < end_date:
             this_week = 0
-            while start_date.weekday != 5:
-                if self.data.get(start_date.iso_format()):
+            while True:
+                if self.data.get(start_date.isoformat()):
                     this_week += 1
                 start_date = start_date + one_day
+                if start_date.weekday() == 5:
+                    break
             weeks.append(this_week)
         return weeks
 
@@ -296,79 +303,7 @@ def extract_activity(fhr, iso_format, day):
             'total_seconds': sum(valid_times),
             'active_seconds': sum(valid_ticks * SECONDS_PER_TICK)}
 
-
-def set_usage_segment(fhr):
-    fhr['usage'] = {'segment': None}
-    # Rely on Python mutable data-type behavior; caveat scriptor
-    reasons = fhr['usage']['reasons_not_segmented'] = []
-    missing_fields = []
-    corrupted_fields = []
-
-    data = fhr.get('data')
-    if not data:
-        missing_fields.append('data')
-
-    fhr['usage']['creation_date'] = data.get('last', {}).get(
-        'org.mozilla.profile.age', {}).get('profileCreation')
-    if not fhr['usage']['creation_date']:
-        missing_fields.append('profileCreation')
-    else:
-        creation_date = parse_date(fhr['usage']['creation_date'])
-        if creation_date is None:
-            corrupted_fields.append('profileCreation')
-
-    def set_history_window(creation_date, ping_date):
-        today = DT.datetime.now().date()
-        if not ((creation_date <= ping_date) and (ping_date <= today)):
-            reasons.append(CLOCK_SKEW % (ping_date, creation_date, today))
-            return
-
-        ping_age = (today - ping_date).days
-        if ping_age > FHR_RETENTION_DAYS:
-            reasons.append(TOO_OLD)
-            return
-
-        ping_less_retention = ping_date - DT.timedelta(FHR_RETENTION_DAYS)
-        start_date = max(creation_date, ping_less_retention)
-        window = (ping_date - start_date).days
-        fhr['usage']['start_date'] = start_date
-        fhr['usage']['window'] = window
-
-    ping_date = fhr.get('thisPingDate')
-    if not ping_date:
-        missing_fields.append('thisPingDate')
-    elif creation_date:
-        ping_date = parse_date(ping_date)
-        if ping_date is None:
-            corrupted_fields.append('thisPingDate')
-        else:
-            set_history_window(fhr, creation_date, ping_date)
-
-    if data.get('days'):
-        if ping_date:
-            # XXX review with dzeber
-            active_days = [(parse_date(d), d) for d in data['days']]
-            active_days = [(date, string) for (date, string) in active_days
-                           if date]
-            active_days = [(date, string) for (date, string) in active_days
-                           if ((fhr['usage']['start_date'] <= date)
-                               and
-                               (date <= ping_date))]
-            active_days.sort()
-            if not active_days:
-                reasons.append(INACTIVE)
-            elif (active_days[-1][0] - active_days[0][0]).days < 14:
-                reasons.append(INACTIVE)
-    else:
-        missing_fields.append('days')
-
-    calculate_default_status(active_days)
-    if fhr['usage']['default']['unmeasured']:
-        reasons.append(DEFAULT_UNMEASURED)
-
-    count_weekly_active_days()
-
-    '''
+'''
     rhcollect(list(
         startdate = histinfo$startdate,
         window = histinfo$window,
@@ -381,44 +316,3 @@ def set_usage_segment(fhr):
         dailynsess = avgnsess,
         dailyhours = avghours),
 '''
-def calculate_default_status(active_days):
-    """
-    Track how often FF is set as the default browser.
-    """
-    default_days = []
-    unmeasured = True
-    never = True
-    switch_count = 0 # -> to int
-    last = None
-    for (date, string) in active_days:
-        app_info = data['days'][string].get(
-            'org.mozilla.appInfo.appinfo', {})
-        is_default = app_info.get('isDefaultBrowser')
-        if is_default:
-            default_days.push((date, string))
-            unmeasured = False
-        elif is_default == 0:
-            unmeasured = False
-            if (last is not None) and (last != is_default):
-                switch_count += 1
-                last = is_default
-
-    active = float(len(active_days))
-    default = float(len(default_days))
-    always = active == default
-    never = not bool(default)
-    ratio = default / active
-    label = 'sometimes'
-    if ratio > 0.8:
-        label = 'mostly'
-    elif ratio < 0.2:
-        label = 'rarely'
-        switches = 'one' if switch_count < 2 else 'multiple'
-    fhr['usage']['default'] = {'active': active,
-                               'default': default,
-                               'always': always,
-                               'label': label,
-                               'never': never,
-                               'switch_count': switch_count,
-                               'switches': switches,
-                               'unmeasured': unmeasured}
