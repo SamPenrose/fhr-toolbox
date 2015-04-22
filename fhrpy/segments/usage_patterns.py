@@ -4,7 +4,7 @@ Port github.com/mozilla/churn-analysis/usage-patterns-jobs.R to Python.
 Rather than discarding bad records, let's mark them with the reason for
 rejecting them.
 """
-import datetime as DT, numbers
+import datetime as DT, json, numbers
 from .. import healthreportutils as HRU
 
 FHR_RETENTION_DAYS = 180
@@ -41,6 +41,9 @@ class FHRUsage(object):
     XXX integrate with healthreportutils.FHRPayload()
     '''
     def __init__(self, fhr):
+        print "**", fhr.split('\n')[0]
+        if fhr == str(fhr):
+            fhr = json.loads(fhr)
         self.fhr = fhr
         self.missing_fields = set()
         self.corrupted_fields = set()

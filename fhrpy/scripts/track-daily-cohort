@@ -1,0 +1,30 @@
+#!/usr/bin/env python
+import datetime as DT, sys
+import mrjob
+from mrjob.job import MRJob
+from fhrpy.segments import usage_patterns as UP
+
+target_date = DT.date.today() - DT.timedelta(150)
+
+class CohortJob(MRJob):
+
+    HADOOP_INPUT_FORMAT="org.apache.hadoop.mapred.SequenceFileAsTextInputFormat"
+    INPUT_PROTOCOL = mrjob.protocol.RawProtocol
+
+    def mapper(self, key, value):
+        print key, value
+        usage = UP.FHRUsage(value) # XXX move to decorator
+        if not usage.creation_date == target_date:
+            return
+        return 'key', 1
+
+    def reducer(self, key, vlist):
+        return key, sum(vlist)
+
+    combiner = reducer
+
+if __name__ == '__main__':
+    if sys.argv[-1].startswith('201'): # a date
+        target_date = DT.date(*sys.argv[-1].split('-'))
+    print "Analyzing cohort for %s" % target_date
+    CohortJob.run() # class?
