@@ -17,6 +17,7 @@ reporting/aggregates/data
 *.dll
 *.exe
 *.o
+*.pyc
 *.so
 
 # Packages #
