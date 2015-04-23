@@ -16,7 +16,8 @@ class CohortJob(MRJob):
         usage = UP.FHRUsage(value) # XXX move to decorator
         if not usage.creation_date == target_date:
             return
-        return 'key', 1
+        # For week in window, yield (sunday, (activity, by, day))
+        yield target_date, usage
 
     def reducer(self, key, vlist):
         return key, sum(vlist)
