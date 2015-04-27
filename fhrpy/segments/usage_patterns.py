@@ -41,7 +41,6 @@ class FHRUsage(object):
     XXX integrate with healthreportutils.FHRPayload()
     '''
     def __init__(self, fhr):
-        print "**", fhr.split('\n')[0]
         if fhr == str(fhr):
             fhr = json.loads(fhr)
         self.fhr = fhr
@@ -206,7 +205,7 @@ class FHRUsage(object):
         while start_date < end_date:
             this_week = 0
             while True:
-                if self.data.get(start_date.isoformat()):
+                if self.days.get(start_date.isoformat()):
                     this_week += 1
                 start_date = start_date + one_day
                 if start_date.weekday() == 5:
