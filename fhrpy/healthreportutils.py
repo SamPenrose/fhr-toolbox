@@ -22,8 +22,6 @@ try:
 except:
     import json
 
-import sys
-
 SessionInfo = namedtuple('SessionInfo', ('total', 'clean', 'active_ticks'))
 
 
@@ -293,6 +291,34 @@ class FHRPayload(object):
                 engine, where = k.rsplit('.', 1)
 
                 yield day, engine, where, v
+
+
+def get_five_month_window(start_string, day_dict):
+    active = set()
+    for d in day_dict:
+        try:
+            when = datetime.date(*[int(s) for s in d.split('-')])
+            month = (when.year, when.month)
+        except Exception:
+            pass
+        else:
+            active.add(month)
+    start = datetime.date(*[int(s) for s in start_string.split('-')])
+    month_window = []
+    month = (start.year, start.month + 1) # immediately subtracted; 13 OK
+    for i in range(0, 5):
+        y, m = month[0], month[1] - 1
+        if m == 0:
+            m = 12
+            y -= 1
+        month = (y, m)
+        month_window.append(month)
+    month_window.reverse()
+    results = []
+    for month in month_window:
+        present = int(month in active)
+        results.append((month, present))
+    return results
 
 
 def base_setup(job):
