@@ -321,6 +321,29 @@ def get_five_month_window(start_string, day_dict):
     return results
 
 
+def get_crash_count(day_dict):
+    crash_dict = day_dict.get('org.mozilla.crashes.crashes', {})
+    crash_counts = [v for k, v in crash_dict.items()
+                    if k.endswith('rash')] or [0]
+    return sum(crash_counts)
+
+
+def get_crashes_in_week(target_date, dict_of_days):
+    while target_date.weekday() != 6:
+        target_date -= datetime.timedelta(1)
+    saturday = target_date + datetime.timedelta(6)
+
+    count = 0
+    for k in dict_of_days:
+        try:
+            day = datetime.datetime.strptime(k, "%Y-%m-%d").date()
+        except Exception, e:
+            continue
+        if target_date <= day <= saturday:
+            count += get_crash_count(dict_of_days[k])
+    return count
+
+
 def base_setup(job):
     job.getConfiguration().set("mapred.job.queue.name", "research")
 
