@@ -48,11 +48,11 @@ class Test_healthreportutils(unittest.TestCase):
     def test_daydict_to_sorted_weeks(self):
         day_dict = {'2015-04-30': {'k1': 'v1'}, # Thurs
                     '2015-05-01': {'k2': 'v2'}, # Fri
-                    '2015-05-23': {'k3': 'v3'}} # Note gap
+                    '2015-05-22': {'k3': 'v3'}} # Note gap
         expected = [
             [{datetime.date(2015, 4, 30): {'k1': 'v1'}},
              {datetime.date(2015, 5, 1): {'k2': 'v2'}},],
-            [{datetime.date(2015, 5, 23): {'k3': 'v3'}}]
+            [{datetime.date(2015, 5, 22): {'k3': 'v3'}}]
         ]
 
         self.assertEqual(HRU.daydict_to_sorted_weeks(day_dict), expected)
@@ -62,6 +62,10 @@ class Test_healthreportutils(unittest.TestCase):
         day_dict[bad] = {}
         self.assertEqual(HRU.daydict_to_sorted_weeks(day_dict, True),
                          (expected, [bad]))
+
+        day_dict['2015-05-23'] = 1
+        expected[-1].append({datetime.date(2015, 5, 23): 1})
+        self.assertEqual(HRU.daydict_to_sorted_weeks(day_dict), expected)
 
 if __name__ == '__main__':
     unittest.main()

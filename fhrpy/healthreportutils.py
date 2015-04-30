@@ -386,7 +386,7 @@ def daydict_to_sorted_weeks(day_dict, return_unparseable=False):
             continue
         if saturday is None:
             saturday = last_saturday(day)
-	if week and (day - saturday > datetime.timedelta(6)):
+	if week and (day - saturday > datetime.timedelta(7)):
 	    weeks.append(week)
 	    week = []
             saturday = last_saturday(day)
