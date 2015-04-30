@@ -293,6 +293,13 @@ class FHRPayload(object):
                 yield day, engine, where, v
 
 
+
+def last_saturday(d):
+    """Return the Saturday on or before the date."""
+    # .weekday in python starts on 0=Monday
+    return d - datetime.timedelta(days=(d.weekday() + 2) % 7)
+
+
 def get_five_month_window(start_string, day_dict):
     active = set()
     for d in day_dict:
@@ -329,10 +336,8 @@ def get_crash_count(day_dict):
 
 
 def get_crashes_in_week(target_date, dict_of_days):
-    while target_date.weekday() != 6:
-        target_date -= datetime.timedelta(1)
+    target_date = last_saturday(target_date) + datetime.timedelta(1)
     saturday = target_date + datetime.timedelta(6)
-
     count = 0
     for k in dict_of_days:
         try:
@@ -342,6 +347,56 @@ def get_crashes_in_week(target_date, dict_of_days):
         if target_date <= day <= saturday:
             count += get_crash_count(dict_of_days[k])
     return count
+
+
+def daydict_to_sorted_weeks(day_dict, return_unparseable=False):
+    '''
+    Convert the FHR 'days' value to a sorted list of sorted lists of dicts
+    whose keys are date() objects and which fall in one calendar week,
+    and optionally a list of unparseable date values:
+        [
+            [(datetime.date(), day_dict[k]), ...], ...
+        ]
+    where the inner lists hold days from a calendar week in order.
+    Therefore passing in:
+        day_dict = {'2015-04-30': {'k1': 'v1', ...}, # Thurs
+                    '2015-05-01': {'k2': 'v2', ...}, # Fri
+                    '2015-05-23': {'k3': 'v3', ...}, # Note gap
+    would return:
+        [
+            [
+             {datetime.date(2015, 4, 30): {'k1': 'v1', ...}},
+             {datetime.date(2015, 5, 1): {'k2': 'v2', ...}},
+            ],
+            [
+             {datetime.date(2015, 5, 23): {'k3': 'v3', ...}}
+            ]
+        ]
+    '''
+    unparseable = []
+    key_list = sorted(day_dict.keys())
+    weeks = []
+    week = []
+    saturday = None
+    for k in key_list:
+        try:
+            day = datetime.datetime.strptime(k, "%Y-%m-%d").date()
+        except Exception, e:
+            unparseable.append(k)
+            continue
+        if saturday is None:
+            saturday = last_saturday(day)
+	if week and (day - saturday > datetime.timedelta(6)):
+	    weeks.append(week)
+	    week = []
+            saturday = last_saturday(day)
+	week.append({day: day_dict[k]})
+    if week:
+        weeks.append(week)
+
+    if return_unparseable:
+        return weeks, unparseable
+    return weeks
 
 
 def base_setup(job):

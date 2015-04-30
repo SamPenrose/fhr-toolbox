@@ -45,6 +45,23 @@ class Test_healthreportutils(unittest.TestCase):
                         '2015-05-01': {KEY: {'crash': 3, 'brash': 1}}}
         self.assertEqual(HRU.get_crashes_in_week(target_date, dict_of_days), 9)
 
+    def test_daydict_to_sorted_weeks(self):
+        day_dict = {'2015-04-30': {'k1': 'v1'}, # Thurs
+                    '2015-05-01': {'k2': 'v2'}, # Fri
+                    '2015-05-23': {'k3': 'v3'}} # Note gap
+        expected = [
+            [{datetime.date(2015, 4, 30): {'k1': 'v1'}},
+             {datetime.date(2015, 5, 1): {'k2': 'v2'}},],
+            [{datetime.date(2015, 5, 23): {'k3': 'v3'}}]
+        ]
+
+        self.assertEqual(HRU.daydict_to_sorted_weeks(day_dict), expected)
+        self.assertEqual(HRU.daydict_to_sorted_weeks({}, True),
+                         ([], []))
+        bad = 'not an ISO formatted date'
+        day_dict[bad] = {}
+        self.assertEqual(HRU.daydict_to_sorted_weeks(day_dict, True),
+                         (expected, [bad]))
 
 if __name__ == '__main__':
     unittest.main()

@@ -32,17 +32,13 @@ main_channels = (
     'release'
 )
 
-def last_saturday(d):
-    """Return the Saturday on or before the date."""
-    # .weekday in python starts on 0=Monday
-    return d - timedelta(days=(d.weekday() + 2) % 7)
 
 def start_date(dstr):
     """
     Measure Sunday-Saturday, for no particularly good reason.
     """
     snapshot = datetime.strptime(dstr, "%Y-%m-%d").date()
-    startdate = last_saturday(snapshot)
+    startdate = healthreportutils.last_saturday(snapshot)
     return startdate
 
 def date_back(start, days, skip=1):
