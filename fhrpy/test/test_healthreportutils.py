@@ -63,8 +63,10 @@ class Test_healthreportutils(unittest.TestCase):
         self.assertEqual(HRU.daydict_to_sorted_weeks(day_dict, True),
                          (expected, [bad]))
 
-        day_dict['2015-05-23'] = 1
-        expected[-1].append({datetime.date(2015, 5, 23): 1})
+        day_dict['2015-04-26'] = 'not a dict' # Sunday of first week
+        expected[0].insert(0, {datetime.date(2015, 4, 26): 'not a dict'})
+        day_dict['2015-05-23'] = 1 # Saturday of second week in sample.
+        expected[1].append({datetime.date(2015, 5, 23): 1})
         self.assertEqual(HRU.daydict_to_sorted_weeks(day_dict), expected)
 
 if __name__ == '__main__':
