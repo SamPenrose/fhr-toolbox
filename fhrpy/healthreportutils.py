@@ -300,7 +300,7 @@ def last_saturday(d):
     return d - datetime.timedelta(days=(d.weekday() + 2) % 7)
 
 
-def get_five_month_window(start_string, day_dict):
+def get_six_month_window(start_string, day_dict):
     active = set()
     for d in day_dict:
         try:
@@ -313,7 +313,7 @@ def get_five_month_window(start_string, day_dict):
     start = datetime.date(*[int(s) for s in start_string.split('-')])
     month_window = []
     month = (start.year, start.month + 1) # immediately subtracted; 13 OK
-    for i in range(0, 5):
+    for i in range(0, 6):
         y, m = month[0], month[1] - 1
         if m == 0:
             m = 12
@@ -333,20 +333,6 @@ def get_crash_count(day_dict):
     crash_counts = [v for k, v in crash_dict.items()
                     if k.endswith('rash')] or [0]
     return sum(crash_counts)
-
-
-def get_crashes_in_week(target_date, dict_of_days):
-    target_date = last_saturday(target_date) + datetime.timedelta(1)
-    saturday = target_date + datetime.timedelta(6)
-    count = 0
-    for k in dict_of_days:
-        try:
-            day = datetime.datetime.strptime(k, "%Y-%m-%d").date()
-        except Exception, e:
-            continue
-        if target_date <= day <= saturday:
-            count += get_crash_count(dict_of_days[k])
-    return count
 
 
 def daydict_to_sorted_weeks(day_dict, return_unparseable=False):
@@ -397,6 +383,29 @@ def daydict_to_sorted_weeks(day_dict, return_unparseable=False):
     if return_unparseable:
         return weeks, unparseable
     return weeks
+
+
+def weekly_crashes_to_churn_mapper(job, key, payload, churn_date):
+    '''
+    Did we crash in the last week we ran, and did we churn?
+    How many times did we crash total, and did we churn?
+    What was our average number of crashes per active day
+    (NOT total days in active window), and did we churn?
+    '''
+    day_dict = payload.get('data', {}).get('days', {})
+    weeks = daydict_to_sorted_weeks(day_dict)
+    if not weeks:
+        return
+    churned = int(churn_date > weeks[-1][-1].keys()[0])
+    crashes = tuple([sum([get_crash_count(d.values()[0])
+                          for d in w])
+                     for w in weeks])
+    last = int(bool(crashes[-1]))
+    yield (('last', churned), last)
+    total = sum(crashes)
+    yield (('total', churned), total)
+    average = (total*1.0) / len(day_dict)
+    yield (('average', churned), average)
 
 
 def base_setup(job):
