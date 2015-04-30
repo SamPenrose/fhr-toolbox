@@ -393,18 +393,42 @@ def weekly_crashes_to_churn_mapper(job, key, payload, churn_date):
     (NOT total days in active window), and did we churn?
     '''
     day_dict = payload.get('data', {}).get('days', {})
-    weeks = daydict_to_sorted_weeks(day_dict)
+    try:
+        weeks = daydict_to_sorted_weeks(day_dict)
+    except Exception:
+        yield ('error-daydict_to_sorted_weeks', 1)
+        return
     if not weeks:
         return
-    churned = int(churn_date > weeks[-1][-1].keys()[0])
-    crashes = tuple([sum([get_crash_count(d.values()[0])
-                          for d in w])
-                     for w in weeks])
-    last = int(bool(crashes[-1]))
+    try:
+        churned = int(churn_date > weeks[-1][-1].keys()[0])
+    except Exception:
+        yield ('error-extracting-churn', 1)
+        return
+    try:
+        crashes = tuple([sum([get_crash_count(d.values()[0])
+                              for d in w])
+                         for w in weeks])
+    except Exception:
+        yield ('error-get_crash_count', 1)
+        return
+    try:
+        last = int(bool(crashes[-1]))
+    except Exception:
+        yield ('error-extracting-last', 1)
+        return
     yield (('last', churned), last)
-    total = sum(crashes)
+    try:
+        total = sum(crashes)
+    except Exception:
+        yield ('error-extracting-total', 1)
+        return
     yield (('total', churned), total)
-    average = (total*1.0) / len(day_dict)
+    try:
+        average = (total*1.0) / len(day_dict)
+    except Exception:
+        yield ('error-extracting-average', 1)
+        return
     yield (('average', churned), average)
 
 
