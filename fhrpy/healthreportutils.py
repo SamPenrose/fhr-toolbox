@@ -392,6 +392,8 @@ def weekly_crashes_to_churn_mapper(job, key, payload, churn_date):
     What was our average number of crashes per active day
     (NOT total days in active window), and did we churn?
     '''
+    if str(churn_date) == churn_date:
+        churn_date = datetime.datetime.strptime(churn_date, "%Y-%m-%d").date()
     day_dict = payload.get('data', {}).get('days', {})
     try:
         weeks = daydict_to_sorted_weeks(day_dict)
