@@ -1,0 +1,289 @@
+#!/usr/bin/env python
+"""
+Analyze a range of dates for new and lost Firefox profiles.
+"""
+
+import healthreportutils
+from datetime import date, datetime, timedelta
+import csv, os, shutil, sys, tempfile, time
+
+import mrjob
+from mrjob.job import MRJob
+
+try:
+    import simplejson as json
+except ImportError:
+    import json
+
+DAYS_PER_WEEK = 7
+TOTAL_DAYS = 168
+
+# How many weeks must a user be gone to be considered "lost"?
+LAG_WEEKS = 4
+
+TOTAL_WEEKS = TOTAL_DAYS / DAYS_PER_WEEK
+
+main_channels = (
+    'nightly',
+    'aurora',
+    'beta',
+    'release'
+)
+
+
+def start_date(dstr):
+    """
+    Measure Sunday-Saturday, for no particularly good reason.
+    """
+    snapshot = datetime.strptime(dstr, "%Y-%m-%d").date()
+    startdate = healthreportutils.last_saturday(snapshot)
+    return startdate
+
+def date_back(start, days, skip=1):
+    """iter backwards from start for N days"""
+    date = start
+    for n in xrange(0, days, skip):
+        yield date - timedelta(days=n)
+
+def active_day(day):
+    if day is None:
+        return False
+    return any(k != "org.mozilla.crashes.crashes" for k in day)
+
+def date_from_epoch_day(number):
+    timestamp = number * 24 * 3600
+    return date.fromtimestamp(timestamp)
+
+def get_creation_date(payload, start, end):
+    days_since_epoch = payload.get('data', {}).get('last', {}).get(
+            'org.mozilla.profile.age', {}).get('profileCreation')
+    if days_since_epoch is None:
+        return ('pcd-missing', None)
+    days_since_epoch = int(days_since_epoch)
+    try:
+        creation_date = date_from_epoch_day(days_since_epoch)
+    except Exception:
+        return ('pcd-corrupt', None)
+
+    if creation_date < start:
+        if (creation_date + timedelta(7)) > start:
+            return ('creation-early-1-week', None)
+        else:
+            return ('creation-early-more', None)
+    if creation_date > end:
+        return ('creation-late', None)
+
+    return (None, creation_date)
+
+def get_ticks(day_dict):
+    activity = day_dict.get('org.mozilla.appSessions.previous', None)
+    if activity is None:
+        return None
+    cleanTicks = activity.get('cleanActiveTicks', [])
+    abortedTicks = activity.get('abortedActiveTicks', [])
+    return sum(cleanTicks) + sum(abortedTicks)
+
+def ticks2hours(ticks):
+    hours = (ticks*5.0) / 3600
+    if hours > 2.0:
+        hours = int(round(hours))
+    elif hours == 0.0:
+        hours = 0
+    else:
+        hours = round(hours, 2)
+    return hours
+
+
+def least_squares(y):
+    N = len(y)
+    x = range(N)
+    regressor = ((sum(x[i] * y[i] for i in xrange(N)) - 1.0/N*sum(x)*sum(y))
+         /
+         (sum(x[i]**2 for i in xrange(N)) - 1.0/N*sum(x)**2))
+    offset = 1.*sum(y)/N - regressor * 1.*sum(x)/N
+    return offset, regressor
+
+
+@healthreportutils.FHRMapper()
+def map(job, key, payload):
+    # Use dataset-window to determine. Note "start_date" misnomer.
+    window_end = datetime.strptime(job.options.start_date, "%Y-%m-%d").date()
+    window_start = window_end - timedelta(180)
+    weekly_activity = {}
+    next_week = window_start # XXX align to Sunday
+    while next_week < window_end:
+        weekly_activity[next_week.isoformat()] = []
+        next_week += timedelta(7)
+
+    problem, creation_date = get_creation_date(payload, window_start, window_end)
+    if problem:
+        yield (problem, 1)
+        return
+
+    day_dict = payload.get('data', {}).get('days', {})
+    days = day_dict.keys()
+    days = [(day, get_ticks, day_dict[day]) for day in days]
+
+    current = payload.get('data', {}).get('last', {}).get(
+        'org.mozilla.appSessions.current', {})
+    current_day = current.get('startDay')
+    if current_day:
+        try:
+            current_day = date_from_epoch_day(int(current_day))
+        except Exception:
+            pass
+        else:
+            def getter(d): return d.get('activeTicks')
+            days.append((current_day.isoformat(), getter, current))
+    days.sort()
+
+    for day, getter, parameter in days:
+        if day < window_start.isoformat():
+            continue
+        if day > window_end.isoformat():
+            break
+        # XXX compare day to window
+        ticks = getter(parameter)
+        if ticks is None:
+            continue
+        hours = ticks2hours(ticks)
+        sunday = day
+        while sunday not in weekly_activity:
+            sunday = (datetime.strptime(sunday, "%Y-%m-%d").date() - timedelta(1)).isoformat()
+        weekly_activity[sunday].append(hours)
+
+    results = []
+    total = 0.0
+    last_regressor = None
+    for week, activity in weekly_activity.items():
+        # XXX we actually want something slightly different
+        # yield an ordered list of (isoformat, activity) tuples since PCD
+        # labelled with curn or no-churn
+        regressor = None
+        if len(activity) > 1:
+            _, regressor = least_squares(activity)
+            last_regressor = regressor
+        weekly = sum(activity)
+        total += weekly
+        results.append((week, weekly))
+    if not total:
+        yield ('sans-activity', 1)
+        return
+    yield ('with-activity', 1)
+
+    results.sort()
+    if sum([t[1] for t in results[-5:]]):
+        yield ('no-churn', total)
+        if last_regressor is not None:
+            yield ('no-churn-regressor', last_regressor)
+    else:
+        yield ('churned', total)
+        if last_regressor is not None:
+            yield ('churned-regressor', last_regressor)
+
+def deciles(l, width):
+    if width < 100:
+        return None
+    l.sort()
+    step = width / 10.0
+    result = []
+    for i in range(10):
+        index = int(round(step*i))
+        result.append(l[index])
+    return '*'.join(str(s) for s in result)
+
+def reduce(job, k, vlist):
+    vlist = list(vlist)
+    vlist.sort()
+    total = sum(vlist)
+    length = len(vlist)
+    if k == 'active-hours':
+        yield (k+'-deciles', deciles(vlist, length))
+        yield (k+'-average', total/float(length))
+        yield (k+'-count', length)
+    if k.endswith('regressor'):
+        yield (k, total/float(length))
+    else:
+        yield (k, total)
+
+class AggJob(MRJob):
+    HADOOP_INPUT_FORMAT="org.apache.hadoop.mapred.SequenceFileAsTextInputFormat"
+    INPUT_PROTOCOL = mrjob.protocol.RawProtocol
+
+    def run_job(self):
+        self.stdout = tempfile.TemporaryFile()
+
+        if self.options.start_date is None:
+            raise Exception("--start-date is required")
+        # validate the start date here
+        start_date(self.options.start_date)
+
+        # Do the big work
+        super(AggJob, self).run_job()
+
+        # Produce the separated output files
+        outpath = self.options.output_path
+        if outpath is None:
+            outpath = os.path.expanduser(("~/%s-%s" % (os.path.basename(__file__), int(time.time()))))
+        output(self.stdout, outpath)
+        print >> sys.stderr, "Output:", outpath
+
+    def configure_options(self):
+        super(AggJob, self).configure_options()
+
+        self.add_passthrough_option('--output-path', help="Specify output path",
+                                    default=None)
+        self.add_passthrough_option('--start-date', help="Specify start date",
+                                    default=None)
+
+    def mapper(self, key, value):
+        return map(self, key, value)
+
+    def reducer(self, key, vlist):
+        return reduce(self, key, vlist)
+
+    # combiner = reducer
+
+def getresults(fd):
+    fd.seek(0)
+    for line in fd:
+        k, v = line.split("\t")
+        yield json.loads(k), json.loads(v)
+
+def unwrap(l, v):
+    """
+    Unwrap a value into a list. Dicts are added in their repr form.
+    """
+    if isinstance(v, (tuple, list)):
+        for e in v:
+            unwrap(l, e)
+    elif isinstance(v, dict):
+        l.append(repr(v))
+    elif isinstance(v, unicode):
+        l.append(v.encode("utf-8"))
+    else:
+        l.append(v)
+
+def output(fd, path):
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        pass
+    os.mkdir(path)
+
+    writers = {}
+    for k, v in getresults(fd):
+        l = []
+        unwrap(l, k)
+        unwrap(l, v)
+        fname = l.pop(0)
+        if fname in writers:
+            w = writers[fname]
+        else:
+            fd = open(os.path.join(path, str(fname) + ".csv"), "w")
+            w = csv.writer(fd)
+            writers[fname] = w
+        w.writerow(l)
+
+if __name__ == '__main__':
+    AggJob.run()

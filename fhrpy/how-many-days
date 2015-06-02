@@ -1,0 +1,149 @@
+#!/usr/bin/env python
+"""
+Analyze a range of dates for new and lost Firefox profiles.
+"""
+
+import healthreportutils
+from datetime import date, datetime, timedelta
+import os, shutil, csv
+import sys, codecs
+import traceback
+
+import mrjob
+from mrjob.job import MRJob
+import tempfile
+
+try:
+    import simplejson as json
+except ImportError:
+    import json
+
+DAYS_PER_WEEK = 7
+TOTAL_DAYS = 168
+
+# How many weeks must a user be gone to be considered "lost"?
+LAG_WEEKS = 4
+
+TOTAL_WEEKS = TOTAL_DAYS / DAYS_PER_WEEK
+
+main_channels = (
+    'nightly',
+    'aurora',
+    'beta',
+    'release'
+)
+
+
+def start_date(dstr):
+    """
+    Measure Sunday-Saturday, for no particularly good reason.
+    """
+    snapshot = datetime.strptime(dstr, "%Y-%m-%d").date()
+    startdate = healthreportutils.last_saturday(snapshot)
+    return startdate
+
+def date_back(start, days, skip=1):
+    """iter backwards from start for N days"""
+    date = start
+    for n in xrange(0, days, skip):
+        yield date - timedelta(days=n)
+
+def active_day(day):
+    if day is None:
+        return False
+    return any(k != "org.mozilla.crashes.crashes" for k in day)
+
+@healthreportutils.FHRMapper()
+def map(job, key, payload):
+    pingDate = payload.get("thisPingDate", "unknown")
+    days = payload.get('data', {}).get('days', {}).keys()
+    days.sort()
+    count = len(days)
+    if count > 6:
+        count = 7
+    yield (count, 1)
+
+def reduce(job, k, vlist):
+    yield (k, sum(vlist))
+
+class AggJob(MRJob):
+    HADOOP_INPUT_FORMAT="org.apache.hadoop.mapred.SequenceFileAsTextInputFormat"
+    INPUT_PROTOCOL = mrjob.protocol.RawProtocol
+
+    def run_job(self):
+        self.stdout = tempfile.TemporaryFile()
+
+        if self.options.start_date is None:
+            raise Exception("--start-date is required")
+        # validate the start date here
+        start_date(self.options.start_date)
+
+        # Do the big work
+        super(AggJob, self).run_job()
+
+        # Produce the separated output files
+        outpath = self.options.output_path
+        if outpath is None:
+            outpath = os.path.expanduser(("~/%s-" % os.path.basename(__file__)) + self.options.start_date)
+        output(self.stdout, outpath)
+
+    def configure_options(self):
+        super(AggJob, self).configure_options()
+
+        self.add_passthrough_option('--output-path', help="Specify output path",
+                                    default=None)
+        self.add_passthrough_option('--start-date', help="Specify start date",
+                                    default=None)
+
+    def mapper(self, key, value):
+        return map(self, key, value)
+
+    def reducer(self, key, vlist):
+        return reduce(self, key, vlist)
+
+    combiner = reducer
+
+def getresults(fd):
+    fd.seek(0)
+    for line in fd:
+        k, v = line.split("\t")
+        yield json.loads(k), json.loads(v)
+
+def unwrap(l, v):
+    """
+    Unwrap a value into a list. Dicts are added in their repr form.
+    """
+    if isinstance(v, (tuple, list)):
+        for e in v:
+            unwrap(l, e)
+    elif isinstance(v, dict):
+        l.append(repr(v))
+    elif isinstance(v, unicode):
+        l.append(v.encode("utf-8"))
+    else:
+        l.append(v)
+
+def output(fd, path):
+    try:
+        shutil.rmtree(path)
+    except OSError:
+        pass
+    os.mkdir(path)
+
+    writers = {}
+    errs = codecs.getwriter("utf-8")(open(os.path.join(path, "exceptions.txt"), "w"))
+    for k, v in getresults(fd):
+        l = []
+        unwrap(l, k)
+        unwrap(l, v)
+        fname = l.pop(0)
+        if fname in writers:
+            w = writers[fname]
+        else:
+            fd = open(os.path.join(path, str(fname) + ".csv"), "w")
+            w = csv.writer(fd)
+            writers[fname] = w
+        w.writerow(l)
+
+if __name__ == '__main__':
+    AggJob.run()

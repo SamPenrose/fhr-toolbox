@@ -1,0 +1,361 @@
+#!/usr/bin/env python
+import datetime as DT, json, numbers, os, sys, tempfile, time
+import mrjob
+from mrjob.job import MRJob
+
+FHR_RETENTION_DAYS = 180
+SECONDS_PER_TICK = 5
+
+MISSING_FIELDS = 'Missing fields: '
+CORRUPTED_FIELDS = 'Corrupted fields: '
+TOO_OLD = "FHR from before 180 day window"
+FROM_FUTURE = "FHR from after 180 day window"
+CLOCK_SKEW = 'Ping date "%s" does not fall between creation date "%s" ' \
+             'and current date "%s"'
+INACTIVE = 'FHR activity spanned less than two weeks'
+DEFAULT_UNMEASURED = 'No data for isDefaultBrowser'
+
+
+class CachedProperty(object):
+    """Decorator that caches the result of a property access.
+
+    Used as an alternative to @property.
+    """
+
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+
+    def __get__(self, instance, instance_type=None):
+        if instance is None:
+            return self
+        value = self.wrapped(instance)
+        setattr(instance, self.wrapped.__name__, value)
+        return value
+
+
+def parse_date(value):
+    """
+    FHR dates take the form '%Y-%m-%d', but Python's wacky date.__init__
+    makes strptime() more trouble than its worth.
+    """
+    result = None
+    parts = str(value).split('-')
+    if len(parts) == 3:
+        try:
+            parts = [int(p) for p in parts]
+            result = DT.date(*parts)
+        except ValueError: # NaN or e.g. month == 0
+            pass
+    return result
+
+
+class FHRUsage(object):
+    '''
+    Wrapper for the JSON blob that calculates its usage data.
+    XXX integrate with healthreportutils.FHRPayload()
+    '''
+    def __init__(self, fhr):
+        print "**", fhr.split('\n')[0]
+        if fhr == str(fhr):
+            fhr = json.loads(fhr)
+        self.fhr = fhr
+        self.missing_fields = set()
+        self.corrupted_fields = set()
+        self.other_problems = set()
+        # Above here should migrate
+        self.reasons = []
+
+    @CachedProperty
+    def data(self):
+        result = self.fhr.get('data', {})
+        if not result:
+            self.missing_fields.add('data')
+        return result
+
+    @CachedProperty
+    def creation_date(self):
+        result = None
+        days_since_epoch = self.data.get('last', {}).get(
+            'org.mozilla.profile.age', {}).get('profileCreation')
+        if days_since_epoch is None:
+            self.missing_fields.add('profileCreation')
+        else:
+            try:
+                timestamp = days_since_epoch * 24 * 3600
+                result = DT.date.fromtimestamp(timestamp)
+            except Exception:
+                self.corrupted_fields.add('profileCreation')
+        return result
+
+    @CachedProperty
+    def ping_date(self):
+        result = None
+        iso_formatted = self.fhr.get('thisPingDate')
+        if iso_formatted is None:
+            self.missing_fields.add('thisPingDate')
+        else:
+            result = parse_date(iso_formatted)
+            if result is None:
+                self.corrupted_fields.add('thisPingDate')
+        return result
+
+    @CachedProperty
+    def start_date(self):
+        if not self.creation_date or not self.ping_date:
+            return None
+
+        today = DT.datetime.now().date()
+        if not ((self.creation_date <= self.ping_date)
+                and (self.ping_date <= today)):
+            self.other_problems.add(
+                CLOCK_SKEW % (self.ping_date, self.creation_date, today))
+            return None
+
+        ping_age = (today - self.ping_date).days
+        if ping_age > FHR_RETENTION_DAYS:
+            self.other_problems.add(TOO_OLD)
+            return None
+        ping_less_retention = self.ping_date - \
+                              DT.timedelta(FHR_RETENTION_DAYS)
+        return max(self.creation_date, ping_less_retention)
+
+    @CachedProperty
+    def window(self):
+        return (self.ping_date - self.start_date).days
+
+    @CachedProperty
+    def days(self):
+        '''
+        A JSON-ish list.
+        '''
+        result = self.data.get('days', {})
+        if not result:
+            self.missing_fields.add('days')
+        return result
+
+    @CachedProperty
+    def active_days(self):
+        '''
+        XXX review with dzeber
+        '''
+        if not self.days or not self.ping_date or not self.start_date:
+            return []
+        active = [parse_date(d) for d in self.days]
+        active = [d for d in active if d] # XXX flag corrupted?
+        active = [d for d in active if
+                  ((self.start_date <= d)
+                   and
+                   (d <= self.ping_date))]
+        active.sort()
+        if not active:
+            self.other_problems.add(INACTIVE)
+        elif (active[-1] - active[0]).days < 14:
+            self.other_problems.add(INACTIVE)
+            return []
+        return active
+
+    @CachedProperty
+    def default(self):
+        '''
+        XXX Too specific to a particular output format.
+        '''
+        if not self.active_days:
+            return {}
+        default_days = []
+        unmeasured = True
+        never = True
+        switch_count = 0 # -> to int
+        last = None
+        for date in self.active_days:
+            app_info = self.days[date.isoformat()].get(
+                'org.mozilla.appInfo.appinfo', {})
+            is_default = app_info.get('isDefaultBrowser')
+            if is_default:
+                default_days.push(date)
+                unmeasured = False
+            elif is_default == 0:
+                unmeasured = False
+                if (last is not None) and (last != is_default):
+                    switch_count += 1
+                last = is_default
+
+        active = float(len(self.active_days))
+        default = float(len(default_days))
+        always = active == default
+        never = not bool(default)
+        ratio = default / active
+        label = 'sometimes'
+        if ratio > 0.8:
+            label = 'mostly'
+        elif ratio < 0.2:
+            label = 'rarely'
+        switches = 'one' if switch_count < 2 else 'multiple'
+        return {'active': active,
+                'default': default,
+                'always': always,
+                'label': label,
+                'never': never,
+                'switch_count': switch_count,
+                'switches': switches,
+                'unmeasured': unmeasured}
+
+    @CachedProperty
+    def weekly_active_days(self):
+        '''
+        The R version threw me; here's my effort. We measure weeks Sa->Su;
+        the datetime.date() object indexes them M->Su::0->6 .
+        '''
+        one_day = DT.timedelta(1)
+        # Truncate to the first Sunday.
+        start_date = self.start_date
+        while start_date.weekday() != 6:
+            start_date = start_date + one_day
+        # Truncate to the last Saturday.
+        end_date = self.ping_date
+        while end_date.weekday() != 5:
+            end_date = end_date - one_day
+
+        weeks = []
+
+        while start_date < end_date:
+            this_week = 0
+            while True:
+                if self.data.get(start_date.isoformat()):
+                    this_week += 1
+                start_date = start_date + one_day
+                if start_date.weekday() == 5:
+                    break
+            weeks.append(this_week)
+        return weeks
+
+    def activity_trend(self):
+        '''
+        XXX find Python equiv to built-in R functions for determining
+        slope of activity against time and p-value of finding.
+        '''
+
+    @CachedProperty
+    def activity_by_day(self):
+        activity = [extract_activity(self.fhr, iso_format, day)
+                    for (iso_format, day) in self.days.items()]
+        activity = [d for d in activity if d]
+        result = {}
+
+        average_sessions_per_day = sum(
+            [d['session_count'] for d in activity]
+        ) / len(self.days) # intentional truncating division
+        if average_sessions_per_day >= 5:
+            result['average_sessions_per_day'] = "5+"
+        else:
+            result['average_sessions_per_day'] = str(
+                average_sessions_per_day)
+        hours = sum(
+            [d['total_seconds'] for d in activity] # not active_seconds
+        ) / 3600.0 # truncate once, in next statement
+        average_hours_per_day = hours / len(self.data['days'])
+        if average_hours_per_day >= 6:
+            result['average_hours_per_day'] = "6+"
+        else:
+            result['average_hours_per_day'] = str(average_hours_per_day)
+        years = (self.ping_date - self.creation_date).days / 365
+        if years >= 5:
+            result['years'] = "5+"
+        else:
+            result['years'] = str(years)
+        result['by_day'] = activity
+        return result
+
+def extract_activity(fhr, iso_format, day):
+    '''
+    mozilla/fhr-r-rollups/activity.R : allActivity : <anon>
+    XXX Do we track per-day record corruption/inadequacy?
+    '''
+    activity = day.get('org.mozilla.appSessions.previous')
+    if not activity:
+        return {}
+
+    # All these are lists of integers
+    clean_seconds = activity.get('cleanTotalTime')
+    if not clean_seconds: # missing or []
+        return {}
+    aborted_seconds = activity.get('abortedTotalTime', [])
+    if len(clean_seconds) != len(aborted_seconds):
+        return {}
+    clean_ticks = activity.get('cleanActiveTicks', [])
+    aborted_ticks = activity.get('abortedActiveTicks', [])
+
+    all_times = clean_seconds + aborted_seconds
+    all_ticks = clean_ticks + aborted_ticks
+    if len(all_times) != len(all_ticks):
+        return {}
+    # XXX also test for lengths of 'firstPaint' and 'main'?
+
+    # Filter any indices which have a bad value of either type
+    # XXX Here we assume that the indices of the all_ lists can be
+    # mapped to each other; theoretically we might map clean_::aborted_
+    RETENTION_SECONDS = FHR_RETENTION_DAYS * 24 * 3600
+    RETENTION_TICKS = RETENTION_SECONDS / SECONDS_PER_TICK
+    valid_times = []
+    valid_ticks = []
+    for i, time_value in enumerate(all_times):
+        # Do we have two valid values?
+        if not isinstance(time_value, numbers.Number):
+            continue
+        if not (0 < time_value < RETENTION_SECONDS):
+            continue
+        tick_value = all_ticks[i]
+        if not isinstance(tick_value, numbers.Number):
+            continue
+        if not (0 <= tick_value < RETENTION_TICKS):
+            continue
+        # Are the values coherent when compared to each other?
+        if (tick_value * SECONDS_PER_TICK) > time_value:
+            continue
+        # Heuristics pass
+        valid_times.append(time_value)
+        valid_ticks.append(tick_value)
+    # XXX activity.R breaks len, sum, sum into a separate function
+    return {'day': iso_format,
+            'session_count': len(valid_times),
+            'total_seconds': sum(valid_times),
+            'active_seconds': sum(valid_ticks * SECONDS_PER_TICK)}
+
+
+target_date = DT.date.today() - DT.timedelta(150)
+class CohortJob(MRJob):
+
+    HADOOP_INPUT_FORMAT="org.apache.hadoop.mapred.SequenceFileAsTextInputFormat"
+    INPUT_PROTOCOL = mrjob.protocol.RawProtocol
+
+    def run_job(self):
+        self.stdout = tempfile.TemporaryFile()
+        MRJob.run_job(self)
+        self.write_results_locally()
+
+    def write_results_locally(self):
+        self.stdout.seek(0)
+        path = os.path.expanduser('~/'+'CohortJob-%s' % int(time.time()))
+        with open(path, 'w') as local:
+            for line in self.stdout.read():
+                local.write(line+'\n')
+        print >> sys.stderr, "Results copied to:", path
+
+    def mapper(self, key, value):
+        # print key, value
+        usage = FHRUsage(value) # XXX move to decorator
+        if False and not usage.creation_date == target_date:
+            return
+        # For week in window, yield (sunday, (activity, by, day))
+
+        yield target_date, usage.weekly_active_days
+
+    def reducer(self, key, vlist):
+        return key, sum(vlist)
+
+    combiner = reducer
+
+if __name__ == '__main__':
+    if sys.argv[-1].startswith('201'): # a date
+        target_date = DT.date(*sys.argv[-1].split('-'))
+    print "Analyzing cohort for %s" % target_date
+    CohortJob.run() # class?
