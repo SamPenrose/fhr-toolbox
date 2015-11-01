@@ -75,6 +75,7 @@ def get_creation_date(payload, start, end):
 
     return (None, creation_date)
 
+
 def get_searches(day_dict):
     searches = day_dict.get('org.mozilla.searches.counts', None)
     if searches is None:
@@ -105,26 +106,18 @@ def least_squares(y):
 @healthreportutils.FHRMapper()
 def map(job, key, payload):
     window_start = datetime.strptime(job.options.start_date, "%Y-%m-%d").date()
-    window_start = window_end + timedelta(7)
-    weekly_activity = {}
-    next_week = window_start
-    churn_window = []
-    while next_week.weekday() != 6:
-        next_week -= timedelta(1)
-    while next_week < window_end:
-        weekly_activity[next_week.isoformat()] = []
-        churn_window.append(next_week.isoformat())
-        next_week += timedelta(7)
-    churn_window = churn_window[-5:]
+    window_end = window_start + timedelta(7)
 
-    problem, creation_date = get_creation_date(payload, window_start, window_end)
-    if problem:
-        yield (problem, 1)
-        return
-
+    total = 0
     day_dict = payload.get('data', {}).get('days', {})
-    days = day_dict.keys()
-    days = [(day, get_searches, day_dict[day]) for day in days]
+    for ds in day_dict:
+        try:
+            date =  datetime.strptime(ds, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if date < window_start or date > window_end:
+            continue
+        total += get_searches(day_dict[day])
 
     current = payload.get('data', {}).get('last', {}).get(
         'org.mozilla.appSessions.current', {})
@@ -135,99 +128,17 @@ def map(job, key, payload):
         except Exception:
             pass
         else:
-            days.append((current_day.isoformat(), get_searches, current))
-    days.sort()
+            if current_day >= window_start and current_day <= window_end:
+                total += get_searches(current)
+    yield ('searches', total)
+    yield ('count', 1)
 
-    # We define churn as whether we have an empty list for the value of
-    # weekly_activity[d] for all d in the last four Sundays.
-    churned = True
-    for day, getter, parameter in days:
-        if day < window_start.isoformat():
-            continue
-        if day > window_end.isoformat():
-            break
-        # XXX compare day to window
-        searches = getter(parameter)
-        sunday = day
-        while sunday not in weekly_activity:
-            sunday = (datetime.strptime(sunday, "%Y-%m-%d").date() - timedelta(1)).isoformat()
-        weekly_activity[sunday].append(searches)
-        if sunday in churn_window:
-            churned = False
-
-    results = []
-    total = 0.0
-    last_regressor = None
-    for week, activity in weekly_activity.items():
-        regressor = None
-        if len(activity) > 1:
-            _, regressor = least_squares(activity)
-            last_regressor = regressor
-        weekly = sum(activity)
-        total += weekly
-        results.append((week, weekly))
-
-    if not total:
-        yield ('sans-activity', 1)
-        return
-    yield ('with-activity', 1)
-
-    results.sort()
-
-    prefix = 'churned' if churned else 'nochurn'
-    # regress last weeks of activity
-    last = results[-1][1]
-    while not last:
-        results.pop()
-        last = results[-1][1]
-
-    yield (prefix+'-count', 1)
-    yield (prefix+'-ztotal', total)
-    if last_regressor is not None:
-        yield (prefix+'-last-week-regressor', last_regressor)
-    if results:
-        try:
-            _, weekly_regressor = least_squares([t[1] for t in results])
-            yield (prefix+'-weekly-regressor', weekly_regressor)
-        except Exception:
-            yield ('weekly-regressor-error', 1)
-        try:
-            _, three_regressor = least_squares([t[1] for t in results[-4:]])
-            yield (prefix+'-three-week-regressor', three_regressor)
-        except Exception:
-            yield ('three-week-regressor-error', 1)
-
-
-def deciles(l, width, cleaner=None):
-    if width < 100:
-        return None
-    l.sort()
-    step = width / 10.0
-    result = []
-    for i in range(1, 10):
-        index = int(round(step*i))
-        value = l[index]
-        if cleaner:
-            value = cleaner(value)
-        result.append(value)
-    return '*'.join(str(s) for s in result)
 
 def reduce(job, k, vlist):
     vlist = list(vlist)
     vlist.sort()
     total = sum(vlist)
-    length = len(vlist)
-    def cleaner(n):
-        return round(n, 2)
-    if k == 'active-hours':
-        yield (k+'-deciles', deciles(vlist, length, cleaner))
-        yield (k+'-average', total/float(length))
-        yield (k+'-count', length)
-    if k.endswith('regressor'):
-        yield (k+'-deciles', deciles(vlist, length, cleaner))
-        yield (k, total/float(length))
-    else:
-        yield (k, total)
+    yield (k, total)
 
 class AggJob(MRJob):
     HADOOP_INPUT_FORMAT="org.apache.hadoop.mapred.SequenceFileAsTextInputFormat"
