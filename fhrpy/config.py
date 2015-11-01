@@ -8,7 +8,7 @@ REDSHIFT = {
     'dbname': os.environ.get('REDSHIFT_DBNAME', 'dev'),
     'port': os.environ.get('REDSHIFT_PORT', 5439),
     'user': os.environ.get('REDSHIFT_USER', 'masteruser'),
-    'password': os.environ.get('REDSHIFT_PASSWORD', 'R5L33n9I2wNl'),
+    'password': os.environ.get('REDSHIFT_PASSWORD', ''),
 }
 
 SEARCH_TABLE = os.environ.get(
